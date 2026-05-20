@@ -42,27 +42,37 @@ That fix is what made me look closer at what the function was really doing.)
 
 For each profile `<name>`:
 
-| What                       | Where                                                        |
-| -------------------------- | ------------------------------------------------------------ |
-| Config / history / skills  | `~/.claude-profiles/<name>/`                                 |
-| OAuth token (backup slot)  | macOS Keychain: `Claude Code-credentials-<name>`             |
-| Account snapshot           | `~/.claude-profiles/<name>/.account.json` (email/org/role)   |
+| What                          | Where                                                              |
+| ----------------------------- | ------------------------------------------------------------------ |
+| Config / history / skills     | `~/.claude-profiles/<name>/`                                       |
+| OAuth token (backup slot)     | macOS Keychain: `Claude Code-credentials-<name>`                   |
+| Account cache (oauthAccount)  | `~/.claude-profiles/<name>/.account.json`                          |
+| Full `~/.claude.json` backup  | `~/.claude-profiles/<name>/.claude-root.json`                      |
 
 On `claude-switch use <name>`:
 
-1. Read the currently active token from Keychain
-   (`Claude Code-credentials`) and write it to the **current** profile's
-   backup slot (`Claude Code-credentials-<current>`).
-2. Read `~/.claude.json`'s `oauthAccount` block and stash a copy under
-   `<current>/.account.json` (so `list` and `current` can still show that
-   profile's email after switching away).
-3. Load the **target** profile's saved token from
-   `Claude Code-credentials-<name>` back into the active slot.
+1. Snapshot the **current** profile's state:
+   - active Keychain token → `Claude Code-credentials-<current>`
+   - `oauthAccount` from `~/.claude.json` → `<current>/.account.json`
+   - whole `~/.claude.json` → `<current>/.claude-root.json`
+2. Restore the **target** profile's token from
+   `Claude Code-credentials-<name>` into the active Keychain slot (or
+   clear it if the target has no saved token — Claude Code will prompt
+   to log in).
+3. Restore the **target** profile's `~/.claude.json` snapshot back to
+   `~/.claude.json` (or remove the file entirely if the target has no
+   snapshot — Claude Code recreates it on next launch).
 4. Repoint the `~/.claude` symlink to `~/.claude-profiles/<name>/`.
 
-When you launch Claude Code next, it reads the new token from the active
-Keychain entry and the new config from `~/.claude/` — a different account,
-no login needed.
+Why step 3 matters: Claude Code reads `~/.claude.json` on launch for
+`oauthAccount`, `/status`, `/usage`, and other account-scoped state. If
+only the Keychain token is swapped, `/status` and `/usage` still show the
+previous account's cached identity until the next API refresh. Swapping
+the whole file keeps every account-scoped surface consistent.
+
+When you launch Claude Code next, it reads the new token from Keychain,
+the new `~/.claude.json` cache, and the new config from `~/.claude/` —
+a different account, no login needed.
 
 ## Requirements
 
@@ -179,12 +189,15 @@ $ claude-switch list
 
 ```
 ~/.claude                           → symlink to one of ~/.claude-profiles/*
-~/.claude.json                      shared cache (Claude Code overwrites it
-                                    on launch; oauthAccount lives here)
+~/.claude.json                      Claude Code's top-level cache. Restored
+                                    from the active profile's snapshot on
+                                    every `claude-switch use`.
 ~/.claude-profiles/
 ├── legacy/
-│   ├── .account.json               oauthAccount snapshot (created by
-│   │                               claude-switch on save/use)
+│   ├── .account.json               oauthAccount snapshot — used by
+│   │                               `claude-switch list` / `current`
+│   ├── .claude-root.json           full ~/.claude.json snapshot — restored
+│   │                               into ~/.claude.json on switch
 │   ├── settings.json
 │   ├── settings.local.json
 │   ├── history.jsonl
@@ -277,12 +290,17 @@ ln -s ~/.claude-profiles/legacy ~/.claude
 - **macOS only.** Linux uses `libsecret` or a different keystore — the
   Keychain commands here don't translate. A Linux port would need a separate
   backend.
-- **Shared `~/.claude.json`.** Claude Code rewrites this file on every
-  launch with the *current* account's info. The per-profile `.account.json`
-  is a snapshot taken at save/switch time, not a live view.
+- **`~/.claude.json` is snapshot-on-switch, not live-synced.** Claude Code
+  rewrites this file every launch with the active account's data;
+  `claude-switch` captures it at switch time. Between two switches, any
+  state Claude Code writes belongs to whichever profile is currently
+  active — that's the intended isolation.
 - **No mid-session migration.** A `--force` switch while Claude Code is
   running won't relocate the running session — only future launches see
   the new profile.
+- **Switching to a profile with no saved snapshot clears `~/.claude.json`.**
+  Claude Code rebuilds the file on next launch (you may re-see the
+  onboarding banner once).
 - **One active login at a time.** macOS Keychain only stores one
   `Claude Code-credentials` entry. Two Claude Code sessions cannot use
   two different accounts in parallel via this tool (use two different macOS

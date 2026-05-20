@@ -15,6 +15,7 @@ ACTIVE_KEY="Claude Code-credentials"
 KEY_PREFIX="Claude Code-credentials-"
 CLAUDE_JSON="$HOME/.claude.json"
 ACCOUNT_FILE=".account.json"
+ROOT_BAK_FILE=".claude-root.json"
 
 die()  { printf '\xe2\x9d\x8c %s\n' "$*" >&2; exit 1; }
 warn() { printf '\xe2\x9a\xa0\xef\xb8\x8f  %s\n' "$*" >&2; }
@@ -73,6 +74,30 @@ account_stash() {
     [[ -n "$oa" && "$oa" != "null" ]]      || return 0
     local target="$BASE_DIR/$name/$ACCOUNT_FILE"
     printf '%s\n' "$oa" > "$target.tmp" && mv "$target.tmp" "$target"
+}
+
+# Snapshot the entire ~/.claude.json (Claude Code's account-cache file) into the profile.
+# This is the file Claude Code reads on launch for oauthAccount, /status, /usage, etc.
+# Without swapping it, switching tokens alone leaves stale account info visible.
+root_stash() {
+    local name="$1"
+    [[ -d "$BASE_DIR/$name" ]] || return 0
+    [[ -r "$CLAUDE_JSON" ]]    || return 0
+    local target="$BASE_DIR/$name/$ROOT_BAK_FILE"
+    cp -p "$CLAUDE_JSON" "$target.tmp" && mv "$target.tmp" "$target"
+}
+
+# Restore <profile>/.claude-root.json into ~/.claude.json. If the profile has no
+# snapshot yet (first-time switch), remove ~/.claude.json so Claude Code starts
+# fresh on the next launch (avoids carrying the previous profile's cache).
+root_restore() {
+    local name="$1"
+    local src="$BASE_DIR/$name/$ROOT_BAK_FILE"
+    if [[ -r "$src" ]]; then
+        cp -p "$src" "$CLAUDE_JSON.tmp" && mv "$CLAUDE_JSON.tmp" "$CLAUDE_JSON"
+    else
+        rm -f "$CLAUDE_JSON"
+    fi
 }
 
 # Look up a field from a profile's stash; fall back to ~/.claude.json if it's the active one.
@@ -180,14 +205,17 @@ cmd_use() {
         return 1
     fi
 
-    # 1) Snapshot current active token → current profile's backup slot
-    if [[ "$current" != "(none)" ]] && kc_exists "$ACTIVE_KEY"; then
-        local active_tok; active_tok="$(kc_read "$ACTIVE_KEY")"
-        if [[ -n "$active_tok" ]]; then
-            kc_save "$KEY_PREFIX$current" "$active_tok"
-            account_stash "$current" || true
-            echo "💾 Saved token of '$current' to keychain"
+    # 1) Snapshot current active token + ~/.claude.json + oauthAccount → current profile
+    if [[ "$current" != "(none)" ]]; then
+        if kc_exists "$ACTIVE_KEY"; then
+            local active_tok; active_tok="$(kc_read "$ACTIVE_KEY")"
+            if [[ -n "$active_tok" ]]; then
+                kc_save "$KEY_PREFIX$current" "$active_tok"
+                echo "💾 Saved token of '$current' to keychain"
+            fi
         fi
+        account_stash "$current" || true
+        root_stash "$current"    || true
     fi
 
     # 2) Restore target profile's token → active slot (or clear if none)
@@ -200,7 +228,10 @@ cmd_use() {
         info "Profile '$name' has no saved token — Claude Code will prompt to log in"
     fi
 
-    # 3) Swap directory symlink
+    # 3) Restore target profile's ~/.claude.json snapshot (or remove if none)
+    root_restore "$name" || true
+
+    # 4) Swap directory symlink
     if [[ -e "$TARGET_LINK" && ! -L "$TARGET_LINK" ]]; then
         die "$TARGET_LINK exists and is not a symlink — move it aside first"
     fi
@@ -221,7 +252,8 @@ cmd_save() {
     [[ -n "$tok" ]] || die "Failed to read active token"
     kc_save "$KEY_PREFIX$name" "$tok"
     account_stash "$name" || true
-    ok "Saved active token to profile '$name'"
+    root_stash "$name"    || true
+    ok "Saved active token + ~/.claude.json to profile '$name'"
 }
 
 cmd_logout() {
