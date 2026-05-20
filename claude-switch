@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# claude-switch — Switch Claude Code accounts (macOS only)
+#
+# Each profile is a directory under ~/.claude-profiles/<name>/ plus a
+# matching macOS Keychain entry "Claude Code-credentials-<name>".
+# Switching swaps both the directory symlink (~/.claude) and the active
+# keychain entry ("Claude Code-credentials"), so the next `claude` session
+# uses a different account without manual login.
+
+set -euo pipefail
+
+BASE_DIR="$HOME/.claude-profiles"
+TARGET_LINK="$HOME/.claude"
+ACTIVE_KEY="Claude Code-credentials"
+KEY_PREFIX="Claude Code-credentials-"
+CLAUDE_JSON="$HOME/.claude.json"
+ACCOUNT_FILE=".account.json"
+
+die()  { printf '\xe2\x9d\x8c %s\n' "$*" >&2; exit 1; }
+warn() { printf '\xe2\x9a\xa0\xef\xb8\x8f  %s\n' "$*" >&2; }
+ok()   { printf '\xe2\x9c\x85 %s\n' "$*"; }
+info() { printf '\xe2\x84\xb9\xef\xb8\x8f  %s\n' "$*"; }
+
+require_macos() {
+    [[ "$(uname -s)" == "Darwin" ]] || die "claude-switch supports macOS only"
+}
+
+current_profile() {
+    if [[ -L "$TARGET_LINK" ]]; then
+        basename "$(readlink "$TARGET_LINK")"
+    else
+        echo "(none)"
+    fi
+}
+
+# ---------- Keychain helpers ----------------------------------------------
+
+kc_read() {
+    # $1 = service name; prints password to stdout, empty if not found
+    security find-generic-password -s "$1" -w 2>/dev/null || true
+}
+
+kc_exists() {
+    security find-generic-password -s "$1" >/dev/null 2>&1
+}
+
+kc_save() {
+    # $1 = service name, $2 = password
+    local service="$1" password="$2"
+    [[ -z "$password" ]] && return 1
+    # Delete-then-add so ACL is reset cleanly. -A trusts any app permanently
+    # (strategy B: no prompt every time Claude Code reads).
+    security delete-generic-password -s "$service" >/dev/null 2>&1 || true
+    security add-generic-password -s "$service" -a "$USER" -w "$password" -A
+}
+
+kc_delete() {
+    security delete-generic-password -s "$1" >/dev/null 2>&1 || true
+}
+
+# ---------- Account info (from ~/.claude.json oauthAccount) ---------------
+
+has_jq() { command -v jq >/dev/null 2>&1; }
+
+# Stash the current account info (from ~/.claude.json) into <profile>/.account.json
+account_stash() {
+    local name="$1"
+    has_jq                                 || return 0
+    [[ -d "$BASE_DIR/$name" ]]             || return 0
+    [[ -r "$CLAUDE_JSON" ]]                || return 0
+    local oa
+    oa="$(jq -c '.oauthAccount // empty' "$CLAUDE_JSON" 2>/dev/null)" || return 0
+    [[ -n "$oa" && "$oa" != "null" ]]      || return 0
+    local target="$BASE_DIR/$name/$ACCOUNT_FILE"
+    printf '%s\n' "$oa" > "$target.tmp" && mv "$target.tmp" "$target"
+}
+
+# Look up a field from a profile's stash; fall back to ~/.claude.json if it's the active one.
+account_field() {
+    local name="$1" field="$2"
+    has_jq || return 0
+    local f="$BASE_DIR/$name/$ACCOUNT_FILE"
+    if [[ -r "$f" ]]; then
+        jq -r --arg k "$field" '.[$k] // empty' "$f" 2>/dev/null
+        return 0
+    fi
+    if [[ "$name" == "$(current_profile)" && -r "$CLAUDE_JSON" ]]; then
+        jq -r --arg k "$field" '.oauthAccount[$k] // empty' "$CLAUDE_JSON" 2>/dev/null
+    fi
+}
+
+# ---------- Safety --------------------------------------------------------
+
+claude_running() {
+    pgrep -f "/claude " >/dev/null 2>&1 \
+        || pgrep -fl "Claude.app/Contents/MacOS" >/dev/null 2>&1 \
+        || pgrep -x "claude" >/dev/null 2>&1
+}
+
+# ---------- Commands ------------------------------------------------------
+
+cmd_create() {
+    local name="${1:-}"
+    [[ -z "$name" ]]                  && die "Usage: claude-switch create <name>"
+    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "Profile name must match [A-Za-z0-9_-]"
+    [[ -d "$BASE_DIR/$name" ]]        && die "Profile '$name' already exists"
+    mkdir -p "$BASE_DIR/$name"
+    ok "Created profile '$name' (at $BASE_DIR/$name)"
+    info "First use: run 'claude-switch use $name', then open Claude Code to log in — the token will be snapshotted automatically when you switch away."
+}
+
+cmd_list() {
+    local current; current="$(current_profile)"
+    echo "📁 Claude Profiles:"
+    local found=0
+    if [[ -d "$BASE_DIR" ]]; then
+        for dir in "$BASE_DIR"/*/; do
+            [[ -d "$dir" ]] || continue
+            found=1
+            local name; name="$(basename "$dir")"
+            local tag="" email
+            email="$(account_field "$name" emailAddress)"
+            local email_str=""
+            [[ -n "$email" ]] && email_str="  👤 $email"
+            if [[ "$name" == "$current" ]]; then
+                if kc_exists "$ACTIVE_KEY"; then
+                    tag=" [token active]"
+                else
+                    tag=" [no token]"
+                fi
+                printf '  ⭐️ %s (active)%s%s\n' "$name" "$tag" "$email_str"
+            else
+                if kc_exists "$KEY_PREFIX$name"; then
+                    tag=" [token saved]"
+                else
+                    tag=" [no token — login required]"
+                fi
+                printf '  -  %s%s%s\n' "$name" "$tag" "$email_str"
+            fi
+        done
+    fi
+    if [[ "$found" -eq 0 ]]; then
+        info "No profiles yet — create one with: claude-switch create <name>"
+    fi
+}
+
+cmd_current() {
+    local cur; cur="$(current_profile)"
+    echo "⭐️ Current profile: $cur"
+    if kc_exists "$ACTIVE_KEY"; then
+        echo "🔑 Active keychain entry: present"
+    else
+        echo "🔑 Active keychain entry: missing (login required)"
+    fi
+    if [[ "$cur" != "(none)" ]]; then
+        local email org role
+        email="$(account_field "$cur" emailAddress)"
+        org="$(account_field "$cur" organizationName)"
+        role="$(account_field "$cur" organizationRole)"
+        [[ -n "$email" ]] && echo "👤 Account: $email"
+        [[ -n "$org"   ]] && echo "🏢 Organization: $org${role:+ ($role)}"
+    fi
+}
+
+cmd_use() {
+    local name="${1:-}"
+    local force=0
+    [[ "${2:-}" == "--force" ]] && force=1
+    [[ -z "$name" ]]            && die "Usage: claude-switch use <name> [--force]"
+    [[ -d "$BASE_DIR/$name" ]]  || die "Profile '$name' not found (list with: claude-switch list)"
+
+    local current; current="$(current_profile)"
+    if [[ "$name" == "$current" ]]; then
+        ok "Already using profile '$name'"
+        return 0
+    fi
+
+    if claude_running && [[ $force -eq 0 ]]; then
+        warn "Claude Code is running — close it first, or pass --force"
+        return 1
+    fi
+
+    # 1) Snapshot current active token → current profile's backup slot
+    if [[ "$current" != "(none)" ]] && kc_exists "$ACTIVE_KEY"; then
+        local active_tok; active_tok="$(kc_read "$ACTIVE_KEY")"
+        if [[ -n "$active_tok" ]]; then
+            kc_save "$KEY_PREFIX$current" "$active_tok"
+            account_stash "$current" || true
+            echo "💾 Saved token of '$current' to keychain"
+        fi
+    fi
+
+    # 2) Restore target profile's token → active slot (or clear if none)
+    if kc_exists "$KEY_PREFIX$name"; then
+        local target_tok; target_tok="$(kc_read "$KEY_PREFIX$name")"
+        kc_save "$ACTIVE_KEY" "$target_tok"
+        echo "🔑 Loaded token of '$name' into active keychain"
+    else
+        kc_delete "$ACTIVE_KEY"
+        info "Profile '$name' has no saved token — Claude Code will prompt to log in"
+    fi
+
+    # 3) Swap directory symlink
+    if [[ -e "$TARGET_LINK" && ! -L "$TARGET_LINK" ]]; then
+        die "$TARGET_LINK exists and is not a symlink — move it aside first"
+    fi
+    rm -f "$TARGET_LINK"
+    ln -s "$BASE_DIR/$name" "$TARGET_LINK"
+
+    ok "Switched to profile '$name'"
+}
+
+cmd_save() {
+    # snapshot current active keychain token → Claude Code-credentials-<name>
+    local name="${1:-}"
+    [[ -z "$name" ]]            && die "Usage: claude-switch save <name>"
+    [[ -d "$BASE_DIR/$name" ]]  || die "Profile '$name' not found"
+    kc_exists "$ACTIVE_KEY"     || die "No active token in Keychain (log in first)"
+
+    local tok; tok="$(kc_read "$ACTIVE_KEY")"
+    [[ -n "$tok" ]] || die "Failed to read active token"
+    kc_save "$KEY_PREFIX$name" "$tok"
+    account_stash "$name" || true
+    ok "Saved active token to profile '$name'"
+}
+
+cmd_logout() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: claude-switch logout <name>"
+    if [[ "$name" == "$(current_profile)" ]]; then
+        kc_delete "$ACTIVE_KEY"
+    fi
+    kc_delete "$KEY_PREFIX$name"
+    ok "Removed token for '$name'"
+}
+
+cmd_rm() {
+    local name="${1:-}"
+    [[ -z "$name" ]]                        && die "Usage: claude-switch rm <name>"
+    [[ "$name" == "legacy" ]]               && die "Cannot remove 'legacy' (reserved)"
+    [[ "$name" == "$(current_profile)" ]]   && die "Cannot remove the active profile — switch away first"
+    [[ -d "$BASE_DIR/$name" ]]              || die "Profile '$name' not found"
+
+    kc_delete "$KEY_PREFIX$name"
+    rm -rf "$BASE_DIR/$name"
+    ok "Removed profile '$name'"
+}
+
+cmd_help() {
+    cat <<'EOF'
+🛠️  claude-switch — Switch Claude Code accounts (macOS)
+
+Usage:
+  claude-switch create <name>          Create a new profile
+  claude-switch list | ls              List all profiles
+  claude-switch current                Show the active profile
+  claude-switch use <name> [--force]   Switch to profile <name>
+                                       (--force if Claude Code is running)
+  claude-switch save <name>            Snapshot active token to profile <name>
+  claude-switch logout <name>          Remove a profile's token (login again next use)
+  claude-switch rm <name>              Remove a profile (directory + token)
+  claude-switch help                   Show this message
+
+Notes:
+  - Each profile holds its own token in macOS Keychain — real account switching
+  - 'legacy' is the reserved default profile
+  - Keychain ACL is set to "trust all apps" so saves/restores never prompt
+EOF
+}
+
+# ---------- Entry ---------------------------------------------------------
+
+require_macos
+
+case "${1:-help}" in
+    create)            shift; cmd_create "${1:-}" ;;
+    list|ls)           cmd_list ;;
+    current)           cmd_current ;;
+    use|select)        shift; cmd_use "${1:-}" "${2:-}" ;;
+    save)              shift; cmd_save "${1:-}" ;;
+    logout)            shift; cmd_logout "${1:-}" ;;
+    rm|delete)         shift; cmd_rm "${1:-}" ;;
+    help|-h|--help)    cmd_help ;;
+    *)                 cmd_help; exit 1 ;;
+esac
