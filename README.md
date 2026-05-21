@@ -10,9 +10,9 @@ profile is genuinely a different logged-in account — no manual re-login.
 ```
 $ claude-switch list
 📁 Claude Profiles:
-  ⭐️ legacy  👤 alice@example.com
-  -  work  👤 bob@example.com
-  -  personal  [login required]
+  ⭐️  legacy    👤  alice@example.com
+  -   work      👤  bob@example.com
+  -   personal  [login required]
 ```
 
 ---
@@ -150,29 +150,29 @@ claude-switch use work
 # → ~/.claude points to the empty 'work' directory
 
 # Launch Claude Code and log in with the second account
-# When you switch away later, claude-switch will snapshot 'work's token automatically
+# When you switch away later, claude-switch will save 'work's token automatically
 ```
 
 ### Switch back
 
 ```sh
 claude-switch use legacy
-# 'work's token is snapshotted, 'legacy's token is restored, ~/.claude swaps
+# 'work's token is saved, 'legacy's token is restored, ~/.claude swaps
 ```
 
 ### Day-to-day inspection
 
 ```sh
 $ claude-switch status
-⭐️ Current profile: legacy
-🔑 Active keychain entry: present
-👤 Account: alice@example.com
-🏢 Organization: Personal (admin)
+⭐️  Profile     legacy
+🔑  Token       active
+👤  Account     alice@example.com
+🏢  Org         Personal (admin)
 
 $ claude-switch list
 📁 Claude Profiles:
-  ⭐️ legacy  👤 alice@example.com
-  -  work  👤 bob@example.com
+  ⭐️  legacy  👤  alice@example.com
+  -   work    👤  bob@example.com
 ```
 
 ## Where the data lives
@@ -260,8 +260,8 @@ works, it just can't read `.account.json`.
 previous install. Switch to any other profile and back; the delete-then-add
 inside `kc_save` rewrites the entry with `-A` and silences future prompts.
 
-**`<name> [token saved]` but no email** — switch away from that profile and
-back; the auto-snapshot on switch will refresh the account info.
+**Profile shows no email** — the account info hasn't been captured yet.
+Switch away from that profile and back; the auto-save on switch will populate it.
 
 **`~/.claude exists and is not a symlink`** — you have a real `~/.claude`
 directory left over from an older install. Move it into the profile
