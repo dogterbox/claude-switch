@@ -49,4 +49,32 @@ if command -v zsh >/dev/null 2>&1 && zsh -ic 'typeset -f claude-switch >/dev/nul
     info "It will shadow this binary — remove it from ~/.zshrc."
 fi
 
-ok "Done. Verify with:  claude-switch help"
+# ---------- First-time profile setup ----------------------------------------
+
+BASE_DIR="$HOME/.claude-profiles"
+TARGET_LINK="$HOME/.claude"
+ACTIVE_KEY="Claude Code-credentials"
+KEY_PREFIX="Claude Code-credentials-"
+
+if [[ -L "$TARGET_LINK" ]]; then
+    info "~/.claude is already managed by claude-switch — skipping profile setup"
+elif [[ -d "$TARGET_LINK" ]]; then
+    info "Setting up claude-switch for the first time..."
+    mkdir -p "$BASE_DIR"
+    mv "$TARGET_LINK" "$BASE_DIR/legacy"
+    ln -s "$BASE_DIR/legacy" "$TARGET_LINK"
+    ok "Moved ~/.claude → ~/.claude-profiles/legacy"
+
+    if security find-generic-password -s "$ACTIVE_KEY" >/dev/null 2>&1; then
+        tok=$(security find-generic-password -s "$ACTIVE_KEY" -w 2>/dev/null)
+        security delete-generic-password -s "${KEY_PREFIX}legacy" >/dev/null 2>&1 || true
+        security add-generic-password -s "${KEY_PREFIX}legacy" -a "$USER" -w "$tok" -A
+        ok "Snapshotted token to profile 'legacy'"
+    else
+        info "No active token found — log in to Claude Code and the token will be saved automatically on your first profile switch"
+    fi
+else
+    info "~/.claude not found — skipping profile setup (run after Claude Code has been launched once)"
+fi
+
+ok "Done. Run 'claude-switch list' to verify."

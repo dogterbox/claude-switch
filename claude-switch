@@ -126,68 +126,73 @@ claude_running() {
 
 cmd_create() {
     local name="${1:-}"
-    [[ -z "$name" ]]                  && die "Usage: claude-switch create <name>"
-    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "Profile name must match [A-Za-z0-9_-]"
-    [[ -d "$BASE_DIR/$name" ]]        && die "Profile '$name' already exists"
+    [[ -z "$name" ]]                    && die "Usage: claude-switch create <name>"
+    [[ "$name" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] || die "Profile name must start with a letter and contain only [A-Za-z0-9_-]"
+    [[ ${#name} -le 20 ]]              || die "Profile name must be 20 characters or fewer"
+    [[ -d "$BASE_DIR/$name" ]]          && die "Profile '$name' already exists"
     mkdir -p "$BASE_DIR/$name"
     ok "Created profile '$name' (at $BASE_DIR/$name)"
-    info "First use: run 'claude-switch use $name', then open Claude Code to log in — the token will be snapshotted automatically when you switch away."
+    info "First use: run 'claude-switch use $name', then open Claude Code to log in — the token will be saved automatically when you switch away."
 }
 
 cmd_list() {
     local current; current="$(current_profile)"
     echo "📁 Claude Profiles:"
-    local found=0
-    if [[ -d "$BASE_DIR" ]]; then
-        for dir in "$BASE_DIR"/*/; do
-            [[ -d "$dir" ]] || continue
-            found=1
-            local name; name="$(basename "$dir")"
-            local tag="" email
-            email="$(account_field "$name" emailAddress)"
-            local email_str=""
-            [[ -n "$email" ]] && email_str="  👤 $email"
-            if [[ "$name" == "$current" ]]; then
-                if kc_exists "$ACTIVE_KEY"; then
-                    tag=" [token active]"
-                else
-                    tag=" [no token]"
-                fi
-                printf '  ⭐️ %s (active)%s%s\n' "$name" "$tag" "$email_str"
-            else
-                if kc_exists "$KEY_PREFIX$name"; then
-                    tag=" [token saved]"
-                else
-                    tag=" [no token — login required]"
-                fi
-                printf '  -  %s%s%s\n' "$name" "$tag" "$email_str"
-            fi
-        done
-    fi
-    if [[ "$found" -eq 0 ]]; then
+
+    if [[ ! -d "$BASE_DIR" ]]; then
         info "No profiles yet — create one with: claude-switch create <name>"
+        return 0
     fi
+
+    # First pass: find longest name for column alignment
+    local max_len=4
+    for dir in "$BASE_DIR"/*/; do
+        [[ -d "$dir" ]] || continue
+        local n; n="$(basename "$dir")"
+        [[ ${#n} -gt $max_len ]] && max_len=${#n}
+    done
+
+    # Second pass: print
+    local found=0
+    for dir in "$BASE_DIR"/*/; do
+        [[ -d "$dir" ]] || continue
+        found=1
+        local name; name="$(basename "$dir")"
+        local email; email="$(account_field "$name" emailAddress)"
+        local suffix=""
+        if [[ "$name" == "$current" ]]; then
+            [[ -n "$email" ]] && suffix="👤  $email"
+            printf '  ⭐️  %-*s  %s\n' "$max_len" "$name" "$suffix"
+        else
+            if kc_exists "$KEY_PREFIX$name"; then
+                [[ -n "$email" ]] && suffix="👤  $email"
+            else
+                suffix="[login required]"
+            fi
+            printf '  -   %-*s  %s\n' "$max_len" "$name" "$suffix"
+        fi
+    done
+
+    [[ $found -eq 0 ]] && info "No profiles yet — create one with: claude-switch create <name>"
 }
 
-cmd_current() {
+cmd_status() {
     local cur; cur="$(current_profile)"
-    echo "⭐️ Current profile: $cur"
-    if kc_exists "$ACTIVE_KEY"; then
-        echo "🔑 Active keychain entry: present"
-    else
-        echo "🔑 Active keychain entry: missing (login required)"
-    fi
+    local token_status
+    if kc_exists "$ACTIVE_KEY"; then token_status="active"; else token_status="missing (login required)"; fi
+    printf '⭐️  %-10s  %s\n' "Profile" "$cur"
+    printf '🔑  %-10s  %s\n' "Token" "$token_status"
     if [[ "$cur" != "(none)" ]]; then
         local email org role
         email="$(account_field "$cur" emailAddress)"
         org="$(account_field "$cur" organizationName)"
         role="$(account_field "$cur" organizationRole)"
-        [[ -n "$email" ]] && echo "👤 Account: $email"
-        [[ -n "$org"   ]] && echo "🏢 Organization: $org${role:+ ($role)}"
+        [[ -n "$email" ]] && printf '👤  %-10s  %s\n' "Account" "$email"
+        [[ -n "$org"   ]] && printf '🏢  %-10s  %s\n' "Org" "$org${role:+ ($role)}"
     fi
 }
 
-cmd_use() {
+cmd_switch() {
     local name="${1:-}"
     local force=0
     [[ "${2:-}" == "--force" ]] && force=1
@@ -196,7 +201,7 @@ cmd_use() {
 
     local current; current="$(current_profile)"
     if [[ "$name" == "$current" ]]; then
-        ok "Already using profile '$name'"
+        ok "Already on profile '$name'"
         return 0
     fi
 
@@ -211,7 +216,6 @@ cmd_use() {
             local active_tok; active_tok="$(kc_read "$ACTIVE_KEY")"
             if [[ -n "$active_tok" ]]; then
                 kc_save "$KEY_PREFIX$current" "$active_tok"
-                echo "💾 Saved token of '$current' to keychain"
             fi
         fi
         account_stash "$current" || true
@@ -222,10 +226,9 @@ cmd_use() {
     if kc_exists "$KEY_PREFIX$name"; then
         local target_tok; target_tok="$(kc_read "$KEY_PREFIX$name")"
         kc_save "$ACTIVE_KEY" "$target_tok"
-        echo "🔑 Loaded token of '$name' into active keychain"
     else
         kc_delete "$ACTIVE_KEY"
-        info "Profile '$name' has no saved token — Claude Code will prompt to log in"
+        info "Profile '$name' has no saved token — log in to Claude Code after switching"
     fi
 
     # 3) Restore target profile's ~/.claude.json snapshot (or remove if none)
@@ -241,41 +244,36 @@ cmd_use() {
     ok "Switched to profile '$name'"
 }
 
-cmd_save() {
-    # snapshot current active keychain token → Claude Code-credentials-<name>
-    local name="${1:-}"
-    [[ -z "$name" ]]            && die "Usage: claude-switch save <name>"
-    [[ -d "$BASE_DIR/$name" ]]  || die "Profile '$name' not found"
-    kc_exists "$ACTIVE_KEY"     || die "No active token in Keychain (log in first)"
+cmd_rename() {
+    local old="${1:-}" new="${2:-}"
+    [[ -z "$old" || -z "$new" ]]  && die "Usage: claude-switch rename <old> <new>"
+    [[ "$new" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] || die "Profile name must start with a letter and contain only [A-Za-z0-9_-]"
+    [[ ${#new} -le 20 ]]               || die "Profile name must be 20 characters or fewer"
+    [[ -d "$BASE_DIR/$old" ]]     || die "Profile '$old' not found"
+    [[ -d "$BASE_DIR/$new" ]]     && die "Profile '$new' already exists"
+    [[ "$old" == "$(current_profile)" ]] && die "Cannot rename the active profile — switch away first"
 
-    local tok; tok="$(kc_read "$ACTIVE_KEY")"
-    [[ -n "$tok" ]] || die "Failed to read active token"
-    kc_save "$KEY_PREFIX$name" "$tok"
-    account_stash "$name" || true
-    root_stash "$name"    || true
-    ok "Saved active token + ~/.claude.json to profile '$name'"
-}
+    mv "$BASE_DIR/$old" "$BASE_DIR/$new"
 
-cmd_logout() {
-    local name="${1:-}"
-    [[ -z "$name" ]] && die "Usage: claude-switch logout <name>"
-    if [[ "$name" == "$(current_profile)" ]]; then
-        kc_delete "$ACTIVE_KEY"
+    if kc_exists "${KEY_PREFIX}${old}"; then
+        local tok; tok="$(kc_read "${KEY_PREFIX}${old}")"
+        kc_save "${KEY_PREFIX}${new}" "$tok"
+        kc_delete "${KEY_PREFIX}${old}"
     fi
-    kc_delete "$KEY_PREFIX$name"
-    ok "Removed token for '$name'"
+
+    ok "Renamed profile '$old' → '$new'"
 }
 
-cmd_rm() {
+cmd_delete() {
     local name="${1:-}"
-    [[ -z "$name" ]]                        && die "Usage: claude-switch rm <name>"
-    [[ "$name" == "legacy" ]]               && die "Cannot remove 'legacy' (reserved)"
-    [[ "$name" == "$(current_profile)" ]]   && die "Cannot remove the active profile — switch away first"
+    [[ -z "$name" ]]                        && die "Usage: claude-switch delete <name>"
+    [[ "$name" == "legacy" ]]               && die "Cannot delete 'legacy' (reserved)"
+    [[ "$name" == "$(current_profile)" ]]   && die "Cannot delete the active profile — switch away first"
     [[ -d "$BASE_DIR/$name" ]]              || die "Profile '$name' not found"
 
     kc_delete "$KEY_PREFIX$name"
     rm -rf "$BASE_DIR/$name"
-    ok "Removed profile '$name'"
+    ok "Deleted profile '$name'"
 }
 
 cmd_help() {
@@ -283,15 +281,14 @@ cmd_help() {
 🛠️  claude-switch — Switch Claude Code accounts (macOS)
 
 Usage:
-  claude-switch create <name>          Create a new profile
-  claude-switch list | ls              List all profiles
-  claude-switch current                Show the active profile
-  claude-switch use <name> [--force]   Switch to profile <name>
-                                       (--force if Claude Code is running)
-  claude-switch save <name>            Snapshot active token to profile <name>
-  claude-switch logout <name>          Remove a profile's token (login again next use)
-  claude-switch rm <name>              Remove a profile (directory + token)
-  claude-switch help                   Show this message
+  claude-switch create <name>               Create a new empty profile
+  claude-switch list                        List all profiles
+  claude-switch status                      Show the active profile + account info
+  claude-switch use <name> [--force]        Switch to profile <name>
+                                            (--force if Claude Code is running)
+  claude-switch rename <old> <new>          Rename a profile
+  claude-switch delete <name>               Delete a profile (directory + token)
+  claude-switch help                        Show this message
 
 Notes:
   - Each profile holds its own token in macOS Keychain — real account switching
@@ -306,12 +303,11 @@ require_macos
 
 case "${1:-help}" in
     create)            shift; cmd_create "${1:-}" ;;
-    list|ls)           cmd_list ;;
-    current)           cmd_current ;;
-    use|select)        shift; cmd_use "${1:-}" "${2:-}" ;;
-    save)              shift; cmd_save "${1:-}" ;;
-    logout)            shift; cmd_logout "${1:-}" ;;
-    rm|delete)         shift; cmd_rm "${1:-}" ;;
+    list)              cmd_list ;;
+    status)            cmd_status ;;
+    use)               shift; cmd_switch "${1:-}" "${2:-}" ;;
+    rename)            shift; cmd_rename "${1:-}" "${2:-}" ;;
+    delete)            shift; cmd_delete "${1:-}" ;;
     help|-h|--help)    cmd_help ;;
     *)                 cmd_help; exit 1 ;;
 esac

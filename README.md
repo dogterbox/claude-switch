@@ -10,9 +10,9 @@ profile is genuinely a different logged-in account — no manual re-login.
 ```
 $ claude-switch list
 📁 Claude Profiles:
-  ⭐️ legacy (active) [token active]  👤 alice@example.com
-  -  work [token saved]  👤 bob@example.com
-  -  personal [no token — login required]
+  ⭐️ legacy  👤 alice@example.com
+  -  work  👤 bob@example.com
+  -  personal  [login required]
 ```
 
 ---
@@ -77,7 +77,7 @@ a different account, no login needed.
 ## Requirements
 
 - **macOS** (uses the `security` CLI and the system Keychain)
-- **`jq`** — only used to display emails in `list` / `current`. Everything
+- **`jq`** — only used to display emails in `list` / `status`. Everything
   else still works without it. (Pre-installed on most setups; otherwise
   `brew install jq`.)
 - **`bash`** — the system `/bin/bash` (3.2) is fine. The script uses `[[ ]]`
@@ -101,6 +101,9 @@ cd ~/MySpaces/claude-switch
 install -m 0755 claude-switch /usr/local/bin/claude-switch
 ```
 
+> Note: manual install skips the automatic profile setup. Run `./install.sh` once
+> to let it migrate `~/.claude`, then copy the binary wherever you need it.
+
 ### Verify
 
 ```sh
@@ -114,41 +117,28 @@ defined in `.zshrc` shadows the binary in `PATH`.
 ## Usage
 
 ```
-claude-switch create <name>          Create a new (empty) profile
-claude-switch list | ls              List profiles + account info
-claude-switch current                Show the active profile + account
-claude-switch use <name> [--force]   Switch to profile <name>
-claude-switch save <name>            Snapshot the active token to profile <name>
-claude-switch logout <name>          Remove a profile's saved token
-claude-switch rm <name>              Remove a profile (directory + token)
-claude-switch help                   Show usage
+claude-switch create <name>               Create a new empty profile
+claude-switch list                        List profiles + account info
+claude-switch status                      Show the active profile + account info
+claude-switch use <name> [--force]        Switch to profile <name>
+claude-switch rename <old> <new>          Rename a profile
+claude-switch delete <name>               Delete a profile (directory + token)
+claude-switch help                        Show usage
 ```
 
 ### First-time setup
 
-If you already have Claude Code installed and logged in, you'll have a real
-`~/.claude/` directory and a `Claude Code-credentials` entry in Keychain.
+The installer handles this automatically. When you run `./install.sh`, it:
 
-1. Create a starting profile (or rename what you have to `legacy` and symlink).
-   The simplest path:
+1. Moves `~/.claude` → `~/.claude-profiles/legacy`
+2. Creates the `~/.claude` symlink
+3. Snapshots your active token into the `legacy` profile
 
-   ```sh
-   mkdir -p ~/.claude-profiles
-   mv ~/.claude ~/.claude-profiles/legacy
-   ln -s ~/.claude-profiles/legacy ~/.claude
-   ```
+Confirm everything looks right after installing:
 
-2. Snapshot the active token + account info into `legacy`:
-
-   ```sh
-   claude-switch save legacy
-   ```
-
-3. Confirm:
-
-   ```sh
-   claude-switch current
-   ```
+```sh
+claude-switch status
+```
 
 ### Add a second account
 
@@ -160,7 +150,7 @@ claude-switch use work
 # → ~/.claude points to the empty 'work' directory
 
 # Launch Claude Code and log in with the second account
-# When you switch away later, claude-switch will save 'work's token automatically
+# When you switch away later, claude-switch will snapshot 'work's token automatically
 ```
 
 ### Switch back
@@ -173,7 +163,7 @@ claude-switch use legacy
 ### Day-to-day inspection
 
 ```sh
-$ claude-switch current
+$ claude-switch status
 ⭐️ Current profile: legacy
 🔑 Active keychain entry: present
 👤 Account: alice@example.com
@@ -181,8 +171,8 @@ $ claude-switch current
 
 $ claude-switch list
 📁 Claude Profiles:
-  ⭐️ legacy (active) [token active]  👤 alice@example.com
-  -  work [token saved]  👤 bob@example.com
+  ⭐️ legacy  👤 alice@example.com
+  -  work  👤 bob@example.com
 ```
 
 ## Where the data lives
@@ -195,7 +185,7 @@ $ claude-switch list
 ~/.claude-profiles/
 ├── legacy/
 │   ├── .account.json               oauthAccount snapshot — used by
-│   │                               `claude-switch list` / `current`
+│   │                               `claude-switch list` / `status`
 │   ├── .claude-root.json           full ~/.claude.json snapshot — restored
 │   │                               into ~/.claude.json on switch
 │   ├── settings.json
@@ -252,9 +242,9 @@ on Intel Homebrew, npm-installed paths, etc.).
   `~/.claude` symlink moves.
 - Per-profile backup tokens stay in Keychain after a switch. Switching back
   restores them; no need to log in again.
-- `claude-switch rm <name>` removes the profile directory and its backup
+- `claude-switch delete <name>` removes the profile directory and its backup
   Keychain entry. There is no trash recovery.
-- `legacy` is a reserved profile name and cannot be removed.
+- `legacy` is a reserved profile name and cannot be deleted.
 
 ## Troubleshooting
 
@@ -267,13 +257,11 @@ works, it just can't read `.account.json`.
 
 **Keychain prompts during a switch** — happens once when the existing
 `Claude Code-credentials` entry has a restrictive ACL inherited from a
-previous install. Re-run `claude-switch save <currentprofile>` once; the
-delete-then-add inside `kc_save` rewrites it with `-A` and silences future
-prompts.
+previous install. Switch to any other profile and back; the delete-then-add
+inside `kc_save` rewrites the entry with `-A` and silences future prompts.
 
-**`<name> [token saved]` but no email** — the token was saved before the
-account-snapshot feature existed in this script. Run `claude-switch save
-<name>` after Claude Code has logged in under that profile.
+**`<name> [token saved]` but no email** — switch away from that profile and
+back; the auto-snapshot on switch will refresh the account info.
 
 **`~/.claude exists and is not a symlink`** — you have a real `~/.claude`
 directory left over from an older install. Move it into the profile
@@ -308,8 +296,7 @@ ln -s ~/.claude-profiles/legacy ~/.claude
 
 ## Development
 
-The whole tool is a single bash script (`claude-switch`), kept under ~250
-lines. Conventions:
+The whole tool is a single bash script (`claude-switch`). Conventions:
 
 - Bash 3.2 compatible (no associative arrays, no `mapfile`).
 - All user-facing strings in English; emojis are language-neutral status icons.
