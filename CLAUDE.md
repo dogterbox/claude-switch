@@ -41,7 +41,7 @@ varies across installs (Homebrew x86/arm, npm, manual).
   `~/.claude-profiles/<name>/.claude-root.json` (written by `root_stash`,
   restored by `root_restore`).
 - **Per-profile account-info snapshot**: `<name>/.account.json` — a
-  smaller `oauthAccount`-only copy used by `list`/`current` to print the
+  smaller `oauthAccount`-only copy used by `list`/`status` to print the
   email. Decorative; the root snapshot is the load-bearing one.
 - **Per-profile dir**: `~/.claude-profiles/<name>/` (target of the
   `~/.claude` symlink).
@@ -49,8 +49,8 @@ varies across installs (Homebrew x86/arm, npm, manual).
 ## Conventions
 
 - User-facing strings are **English only**. Emojis allowed as status icons
-  (✅ ⚠️ ❌ ⭐️ 🔑 💾 ℹ️ 👤 🏢 📁) — don't add new emojis without reason.
-- The `legacy` profile name is reserved and cannot be removed.
+  (✅ ⚠️ ❌ ⭐️ 🔑 ℹ️ 👤 🏢 📁) — don't add new emojis without reason.
+- The `legacy` profile name is reserved and cannot be deleted.
 - Every command function should exit 0 on success. A common pitfall: a
   trailing `[[ ... ]] && echo ...` returns non-zero when the test is
   false. Wrap in `if ... then ... fi` to preserve exit status.
@@ -63,7 +63,7 @@ bash -n install.sh
 ```
 
 Then exercise the behavioral changes manually — there's no test suite.
-Especially verify: `claude-switch help`, `list`, `current` all exit 0.
+Especially verify: `claude-switch help`, `list`, `status` all exit 0.
 
 ## Out of scope
 
