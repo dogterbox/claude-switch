@@ -124,6 +124,12 @@ claude-switch use <name> [--force]        Switch to profile <name>
 claude-switch rename <old> <new>          Rename a profile
 claude-switch delete <name>               Delete a profile (directory + token)
 claude-switch help                        Show usage
+
+# Parallel mode (requires jq)
+claude-switch env <name>                  Print export statements for the profile
+claude-switch run <name> [-- cmd...]      Run a command as the profile (default: claude)
+claude-switch refresh <name>              Refresh and re-save the profile's token
+claude-switch wrapper <name>              Write a wrapper script, print its path
 ```
 
 ### First-time setup
@@ -273,6 +279,83 @@ mv ~/.claude ~/.claude-profiles/legacy
 ln -s ~/.claude-profiles/legacy ~/.claude
 ```
 
+## Parallel mode — two accounts at once
+
+The `use` command switches a single global login. Parallel mode lets two
+windows/terminals run **different accounts simultaneously** by setting
+`CLAUDE_CODE_OAUTH_TOKEN` per-process (the env var overrides Keychain at
+runtime) and `CLAUDE_CONFIG_DIR` pointing at the profile directory.
+
+Requires `jq` (`brew install jq`).
+
+### terminal / tmux / direnv
+
+```sh
+# Activate in the current shell
+eval "$(claude-switch env work)"
+claude           # runs as 'work' account
+
+# Or launch a single command without eval
+claude-switch run work -- claude chat
+```
+
+With [direnv](https://direnv.net/), add to `.envrc`:
+
+```sh
+eval "$(claude-switch env work)"
+```
+
+### VS Code — per-repo account
+
+In each repo's `.vscode/settings.json`:
+
+```jsonc
+{
+  "claudeCode.claudeProcessWrapper": "/Users/<you>/.claude-profiles/work/launch"
+}
+```
+
+Generate the wrapper script once:
+
+```sh
+claude-switch wrapper work
+# → /Users/<you>/.claude-profiles/work/launch
+```
+
+The wrapper reads a fresh token from Keychain every time VS Code starts a
+Claude Code process — no secret is stored in the settings file.
+
+Open Repo A (pointing at `work`) and Repo B (pointing at `personal`) in
+separate VS Code windows; each gets its own account automatically.
+
+### Token refresh
+
+Tokens expire after ~24 hours. `env`, `run`, and `wrapper` all refresh
+automatically when the token is within 60 seconds of expiry. You can also
+refresh on demand:
+
+```sh
+claude-switch refresh work
+```
+
+If the refresh token itself is expired (rare), you'll get a clear error:
+
+```
+❌ Could not refresh token for 'work' — run 'claude-switch use work' and log in to Claude Code
+```
+
+### Known limitations (parallel mode)
+
+- **`jq` is required.** The four parallel commands die immediately without it.
+- **Two windows on the *same* profile share `history.jsonl` / `projects/`.**
+  Per-session files are keyed by session ID so data corruption is unlikely,
+  but concurrent config writes to the same profile are not isolated.
+- **VS Code `scope=window` only.** A single multi-root workspace cannot
+  split accounts per-folder — each *window* is one account.
+- **`client_id` and token endpoint** (`9d1c250a-…`, `platform.claude.com`)
+  are undocumented internals extracted from the Claude Code v2.1.186
+  binary. A future release may change them; file an issue if refresh breaks.
+
 ## Limitations
 
 - **macOS only.** Linux uses `libsecret` or a different keystore — the
@@ -289,10 +372,6 @@ ln -s ~/.claude-profiles/legacy ~/.claude
 - **Switching to a profile with no saved snapshot clears `~/.claude.json`.**
   Claude Code rebuilds the file on next launch (you may re-see the
   onboarding banner once).
-- **One active login at a time.** macOS Keychain only stores one
-  `Claude Code-credentials` entry. Two Claude Code sessions cannot use
-  two different accounts in parallel via this tool (use two different macOS
-  user accounts for that).
 
 ## Development
 

@@ -17,6 +17,13 @@ CLAUDE_JSON="$HOME/.claude.json"
 ACCOUNT_FILE=".account.json"
 ROOT_BAK_FILE=".claude-root.json"
 
+# OAuth refresh — recovered from Claude Code binary v2.1.186 (function `mQ`).
+# These are undocumented internals and may change in a future Claude release.
+OAUTH_TOKEN_URL="https://platform.claude.com/v1/oauth/token"
+OAUTH_CLIENT_ID="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# Refresh when the token expires within this many seconds.
+TOKEN_REFRESH_SKEW=60
+
 die()  { printf '\xe2\x9d\x8c %s\n' "$*" >&2; exit 1; }
 warn() { printf '\xe2\x9a\xa0\xef\xb8\x8f  %s\n' "$*" >&2; }
 ok()   { printf '\xe2\x9c\x85 %s\n' "$*"; }
@@ -57,6 +64,123 @@ kc_save() {
 
 kc_delete() {
     security delete-generic-password -s "$1" >/dev/null 2>&1 || true
+}
+
+# ---------- Parallel mode: token refresh engine ---------------------------
+#
+# Parallel mode runs Claude Code with a per-process CLAUDE_CODE_OAUTH_TOKEN
+# (which overrides the global Keychain at runtime) plus a per-process
+# CLAUDE_CONFIG_DIR. This lets multiple windows use different accounts
+# simultaneously without touching the active Keychain slot or the symlink.
+#
+# OAuth access tokens expire (~24h) and the refresh token ROTATES on every
+# refresh, so a fresh refresh token must be written back to the profile's
+# Keychain backup slot or the next refresh fails. All parallel-mode commands
+# go through profile_access_token().
+
+require_jq() {
+    has_jq || die "This command needs 'jq' (brew install jq)"
+}
+
+now_ms() {
+    # Bash 3.2 has no millisecond clock; use python3 (present on macOS).
+    python3 -c 'import time;print(int(time.time()*1000))'
+}
+
+# Acquire a per-profile lock (atomic mkdir; bash 3.2 has no flock).
+# Waits up to ~10s, then assumes a stale lock and proceeds.
+refresh_lock() {
+    local lock="$BASE_DIR/$1/.refresh.lock"
+    local i=0
+    while ! mkdir "$lock" 2>/dev/null; do
+        i=$((i + 1))
+        [[ $i -ge 20 ]] && { rm -rf "$lock" 2>/dev/null; mkdir "$lock" 2>/dev/null; break; }
+        sleep 0.5
+    done
+    REFRESH_LOCK_DIR="$lock"
+}
+
+refresh_unlock() {
+    [[ -n "${REFRESH_LOCK_DIR:-}" ]] && rm -rf "$REFRESH_LOCK_DIR" 2>/dev/null
+    REFRESH_LOCK_DIR=""
+}
+
+# POST the refresh token; on success rewrite the Keychain backup blob.
+# Echoes the new access token on stdout. Returns non-zero on hard failure.
+do_refresh() {
+    local name="$1" blob="$2"
+    local rt; rt="$(printf '%s' "$blob" | jq -r '.claudeAiOauth.refreshToken // empty')"
+    [[ -n "$rt" ]] || return 2   # no refresh token → caller must re-login
+
+    local body resp http
+    body="$(jq -nc --arg rt "$rt" --arg cid "$OAUTH_CLIENT_ID" \
+        '{grant_type:"refresh_token",refresh_token:$rt,client_id:$cid}')"
+
+    local attempt=0 delay=2
+    while [[ $attempt -lt 3 ]]; do
+        attempt=$((attempt + 1))
+        resp="$(curl -s -w $'\n%{http_code}' -X POST "$OAUTH_TOKEN_URL" \
+            -H "Content-Type: application/json" -d "$body" 2>/dev/null)"
+        http="${resp##*$'\n'}"
+        resp="${resp%$'\n'*}"
+        case "$http" in
+            200) break ;;
+            429) sleep "$delay"; delay=$((delay * 2)); continue ;;
+            *)   return 3 ;;   # invalid_grant / other → re-login needed
+        esac
+    done
+    [[ "$http" == "200" ]] || return 3
+
+    local new_at new_rt new_exp exp_ms
+    new_at="$(printf '%s' "$resp" | jq -r '.access_token // empty')"
+    new_rt="$(printf '%s' "$resp" | jq -r '.refresh_token // empty')"
+    new_exp="$(printf '%s' "$resp" | jq -r '.expires_in // empty')"
+    [[ -n "$new_at" ]] || return 3
+    [[ -n "$new_rt" ]] || new_rt="$rt"           # fall back if not rotated
+    exp_ms="$(( $(now_ms) + ${new_exp:-3600} * 1000 ))"
+
+    # Rebuild the blob preserving every other field (trustedDeviceToken, etc.)
+    local new_blob
+    new_blob="$(printf '%s' "$blob" | jq -c \
+        --arg at "$new_at" --arg rt "$new_rt" --argjson exp "$exp_ms" \
+        '.claudeAiOauth.accessToken=$at
+         | .claudeAiOauth.refreshToken=$rt
+         | .claudeAiOauth.expiresAt=$exp')"
+    kc_save "$KEY_PREFIX$name" "$new_blob" >/dev/null 2>&1
+    printf '%s' "$new_at"
+}
+
+# Resolve a fresh access token for <profile>. Refreshes if expired.
+# Echoes the access token; dies with a clear message if unrecoverable.
+profile_access_token() {
+    local name="$1"
+    [[ -d "$BASE_DIR/$name" ]] || die "Profile '$name' not found (claude-switch list)"
+    kc_exists "$KEY_PREFIX$name" \
+        || die "Profile '$name' has no saved token — run 'claude-switch use $name' and log in first"
+
+    refresh_lock "$name"
+    trap refresh_unlock EXIT
+
+    local blob exp now at
+    blob="$(kc_read "$KEY_PREFIX$name")"
+    exp="$(printf '%s' "$blob" | jq -r '.claudeAiOauth.expiresAt // 0')"
+    now="$(now_ms)"
+
+    if [[ "$exp" -gt $(( now + TOKEN_REFRESH_SKEW * 1000 )) ]]; then
+        at="$(printf '%s' "$blob" | jq -r '.claudeAiOauth.accessToken // empty')"
+    else
+        local rc=0
+        at="$(do_refresh "$name" "$blob")" || rc=$?
+        if [[ $rc -ne 0 || -z "$at" ]]; then
+            refresh_unlock; trap - EXIT
+            die "Could not refresh token for '$name' — run 'claude-switch use $name' and log in to Claude Code"
+        fi
+    fi
+
+    refresh_unlock
+    trap - EXIT
+    [[ -n "$at" ]] || die "No token available for '$name'"
+    printf '%s' "$at"
 }
 
 # ---------- Account info (from ~/.claude.json oauthAccount) ---------------
@@ -276,6 +400,67 @@ cmd_delete() {
     ok "Deleted profile '$name'"
 }
 
+# ---------- Parallel-mode commands ----------------------------------------
+
+# Resolve the claude binary to exec (used by `run` and the wrapper script).
+claude_bin() {
+    if [[ -n "${CLAUDE_CODE_EXECPATH:-}" && -x "$CLAUDE_CODE_EXECPATH" ]]; then
+        printf '%s' "$CLAUDE_CODE_EXECPATH"
+    else
+        command -v claude || die "claude binary not found in PATH"
+    fi
+}
+
+cmd_env() {
+    require_jq
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: claude-switch env <profile>"
+    local tok; tok="$(profile_access_token "$name")"
+    printf 'export CLAUDE_CONFIG_DIR=%q\n' "$BASE_DIR/$name"
+    printf 'export CLAUDE_CODE_OAUTH_TOKEN=%q\n' "$tok"
+}
+
+cmd_run() {
+    require_jq
+    local name="${1:-}"; shift || true
+    [[ -z "$name" ]] && die "Usage: claude-switch run <profile> [-- <cmd...>]"
+    [[ "${1:-}" == "--" ]] && shift
+    local tok; tok="$(profile_access_token "$name")"
+    export CLAUDE_CONFIG_DIR="$BASE_DIR/$name"
+    export CLAUDE_CODE_OAUTH_TOKEN="$tok"
+    if [[ $# -eq 0 ]]; then
+        exec "$(claude_bin)"
+    else
+        exec "$@"
+    fi
+}
+
+cmd_refresh() {
+    require_jq
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: claude-switch refresh <profile>"
+    profile_access_token "$name" >/dev/null
+    ok "Token for '$name' is fresh"
+}
+
+cmd_wrapper() {
+    require_jq
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: claude-switch wrapper <profile>"
+    [[ -d "$BASE_DIR/$name" ]] || die "Profile '$name' not found (claude-switch list)"
+    local self; self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    local script="$BASE_DIR/$name/launch"
+    cat > "$script.tmp" <<EOF
+#!/usr/bin/env bash
+# Auto-generated by claude-switch — launches Claude Code as profile '$name'.
+# No token is stored here; it is read (and refreshed) from Keychain at launch.
+# Use as VS Code "claudeCode.claudeProcessWrapper".
+exec "$self" run $name -- "\$@"
+EOF
+    chmod 0755 "$script.tmp" && mv "$script.tmp" "$script"
+    printf '%s\n' "$script"
+}
+
 cmd_help() {
     cat <<'EOF'
 🛠️  claude-switch — Switch Claude Code accounts (macOS)
@@ -290,8 +475,18 @@ Usage:
   claude-switch delete <name>               Delete a profile (directory + token)
   claude-switch help                        Show this message
 
+Parallel mode (run multiple accounts at once, needs jq):
+  claude-switch env <profile>               Print export lines for a profile
+                                            (eval "$(claude-switch env work)")
+  claude-switch run <profile> [-- <cmd>]    Run claude (or <cmd>) as <profile>
+  claude-switch refresh <profile>           Refresh a profile's token now
+  claude-switch wrapper <profile>           Make a launcher for VS Code's
+                                            claudeCode.claudeProcessWrapper
+
 Notes:
   - Each profile holds its own token in macOS Keychain — real account switching
+  - 'use' swaps the single active login; parallel mode runs many at once via
+    per-process CLAUDE_CODE_OAUTH_TOKEN + CLAUDE_CONFIG_DIR (no Keychain swap)
   - 'legacy' is the reserved default profile
   - Keychain ACL is set to "trust all apps" so saves/restores never prompt
 EOF
@@ -308,6 +503,10 @@ case "${1:-help}" in
     use)               shift; cmd_switch "${1:-}" "${2:-}" ;;
     rename)            shift; cmd_rename "${1:-}" "${2:-}" ;;
     delete)            shift; cmd_delete "${1:-}" ;;
+    env)               shift; cmd_env "${1:-}" ;;
+    run)               shift; cmd_run "$@" ;;
+    refresh)           shift; cmd_refresh "${1:-}" ;;
+    wrapper)           shift; cmd_wrapper "${1:-}" ;;
     help|-h|--help)    cmd_help ;;
     *)                 cmd_help; exit 1 ;;
 esac
