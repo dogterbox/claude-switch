@@ -169,6 +169,23 @@ profile_access_token() {
     if [[ "$exp" -gt $(( now + TOKEN_REFRESH_SKEW * 1000 )) ]]; then
         at="$(printf '%s' "$blob" | jq -r '.claudeAiOauth.accessToken // empty')"
     else
+        # Backup slot is expired. If this is the currently active profile,
+        # Claude Code may have written a fresh token to the active slot after
+        # a recent login — read it and update the backup slot before refreshing.
+        if [[ "$name" == "$(current_profile)" ]] && kc_exists "$ACTIVE_KEY"; then
+            local active_blob active_exp
+            active_blob="$(kc_read "$ACTIVE_KEY")"
+            active_exp="$(printf '%s' "$active_blob" | jq -r '.claudeAiOauth.expiresAt // 0')"
+            if [[ "$active_exp" -gt $(( now + TOKEN_REFRESH_SKEW * 1000 )) ]]; then
+                kc_save "$KEY_PREFIX$name" "$active_blob"
+                blob="$active_blob"
+                at="$(printf '%s' "$blob" | jq -r '.claudeAiOauth.accessToken // empty')"
+                refresh_unlock; trap - EXIT
+                [[ -n "$at" ]] || die "No token available for '$name'"
+                printf '%s' "$at"
+                return
+            fi
+        fi
         local rc=0
         at="$(do_refresh "$name" "$blob")" || rc=$?
         if [[ $rc -ne 0 || -z "$at" ]]; then
