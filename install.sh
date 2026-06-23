@@ -49,6 +49,43 @@ if command -v zsh >/dev/null 2>&1 && zsh -ic 'typeset -f claude-switch >/dev/nul
     info "It will shadow this binary — remove it from ~/.zshrc."
 fi
 
+# ---------- Shell function setup ---------------------------------------------
+
+SHELL_FUNC='
+# claude-switch: auto-eval env subcommand
+claude-switch() {
+  if [[ "${1:-}" == "env" ]]; then
+    eval "$(command claude-switch env "${2:-}")"
+  else
+    command claude-switch "$@"
+  fi
+}'
+
+append_shell_func() {
+    local rc="$1"
+    if grep -q 'command claude-switch env' "$rc" 2>/dev/null; then
+        info "Shell function already present in $rc — skipping"
+    else
+        printf '\n%s\n' "$SHELL_FUNC" >> "$rc"
+        ok "Appended shell function to $rc"
+        info "Run: source $rc"
+    fi
+}
+
+printf '\nInstall shell function for '\''claude-switch env'\'' auto-eval?\n'
+printf '  1) zsh  (~/.zshrc)\n'
+printf '  2) bash (~/.bashrc)\n'
+printf '  3) both\n'
+printf '  4) skip\n'
+printf 'Choice [1-4]: '
+read -r shell_choice </dev/tty
+case "${shell_choice:-4}" in
+    1) append_shell_func "$HOME/.zshrc" ;;
+    2) append_shell_func "$HOME/.bashrc" ;;
+    3) append_shell_func "$HOME/.zshrc"; append_shell_func "$HOME/.bashrc" ;;
+    *) info "Skipping shell function setup" ;;
+esac
+
 # ---------- First-time profile setup ----------------------------------------
 
 BASE_DIR="$HOME/.claude-profiles"

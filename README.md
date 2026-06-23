@@ -59,8 +59,9 @@ Verify:
 claude-switch status
 ```
 
-If you had a `claude-switch` shell function in `~/.zshrc`, remove it — a
-function in `.zshrc` shadows the binary in `PATH`.
+The installer will ask whether to append a shell function to `~/.zshrc`,
+`~/.bashrc`, or both. This function makes `claude-switch env <name>` apply
+the export directly to your current shell — no manual `eval` needed.
 
 ---
 
@@ -136,21 +137,47 @@ claude-switch wrapper <name>          Write a launcher script, print its path
 
 ### Terminal / tmux
 
-```sh
-# Inject into the current shell session
-eval "$(claude-switch env work)"
-claude                              # runs as 'work' account
+With the shell function installed (see above), `env` applies directly:
 
-# One-shot without eval
+```sh
+claude-switch env work
+claude                              # runs as 'work' account
+```
+
+Without the shell function, wrap with `eval`:
+
+```sh
+eval "$(claude-switch env work)"
+```
+
+One-shot without touching the current shell:
+
+```sh
 claude-switch run personal -- claude chat
 ```
 
 ### direnv (per-directory, automatic)
 
-Add to `.envrc` in a repo:
+direnv runs `.envrc` in its own subshell and does not load your `~/.zshrc`
+shell functions. Use `eval "$(command claude-switch env ...)"` explicitly:
 
 ```sh
-eval "$(claude-switch env work)"
+# .envrc
+eval "$(command claude-switch env work)"
+```
+
+To keep the syntax short across projects, add a helper to
+`~/.config/direnv/direnvrc`:
+
+```sh
+# ~/.config/direnv/direnvrc
+claude_env() { eval "$(command claude-switch env "${1:-}")"; }
+```
+
+Then each `.envrc` becomes:
+
+```sh
+claude_env work
 ```
 
 Every `cd` into that directory activates the `work` account.
