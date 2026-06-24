@@ -120,9 +120,9 @@ previous account until the next API refresh.
 
 ## Parallel mode
 
-Run two accounts at the same time by injecting `CLAUDE_CODE_OAUTH_TOKEN` and
-`CLAUDE_CONFIG_DIR` as process-level environment variables — they override
-the global Keychain entry at runtime. Tokens are refreshed automatically.
+Run two accounts at the same time by setting `CLAUDE_CONFIG_DIR` to a profile directory.
+Claude Code reads and automatically manages tokens in the profile's Keychain slot,
+allowing VS Code windows to stay alive and auto-refresh tokens without manual intervention.
 
 **Requires `jq`.**
 
@@ -204,8 +204,12 @@ In each repo's `.vscode/settings.json`:
 { "claudeCode.claudeProcessWrapper": "/Users/<you>/.claude-profiles/personal/launch" }
 ```
 
-Open each repo in a separate VS Code window. The wrapper reads a fresh token
-from Keychain at each launch — no secret is stored in the settings file.
+Open each repo in a separate VS Code window. The wrapper ensures the profile's token
+is fresh on launch, and Claude Code automatically manages token refresh during the session.
+No secret is stored in the settings file.
+
+**Token expiry:** When a token expires during a VS Code session, Claude Code automatically
+refreshes it from the Keychain without requiring a window restart or manual CLI invocation.
 
 > VS Code's `claudeCode.claudeProcessWrapper` setting is `scope=window`. A single
 > multi-root workspace cannot split accounts per-folder; each window is one account.
@@ -249,11 +253,18 @@ If the refresh token is dead (requires a new login):
 Keychain entries (visible in Keychain Access.app, search "Claude"):
 
 ```
-Claude Code-credentials              ← active slot, read by Claude Code
+Claude Code-credentials              ← active slot (swap mode only)
 Claude Code-credentials-legacy       ← backup for 'legacy' profile
-Claude Code-credentials-work
-Claude Code-credentials-personal
+Claude Code-credentials-work         ← backup for 'work' profile
+Claude Code-credentials-personal     ← backup for 'personal' profile
+
+Claude Code-credentials-37efd47a     ← hash slot for 'work' (parallel mode)
+Claude Code-credentials-<hash8>      ← hash slots for other profiles
 ```
+
+Swap mode uses the backup slots (e.g., `-work`). Parallel mode uses hash-based
+slots (e.g., `-37efd47a`). The hash is computed as `sha256(profile_dir)[:8]`.
+Both get written when a token is refreshed, so they stay in sync.
 
 ---
 

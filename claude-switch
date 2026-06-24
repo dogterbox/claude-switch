@@ -66,17 +66,27 @@ kc_delete() {
     security delete-generic-password -s "$1" >/dev/null 2>&1 || true
 }
 
+# Compute the hash slot that Claude Code uses for a given config directory.
+# Claude Code computes: sha256(configDir)[:8] where configDir has no normalization.
+hash_slot() {
+    local config_dir="$1"
+    local hash
+    hash="$(printf '%s' "$config_dir" | shasum -a 256 | cut -d' ' -f1)"
+    printf '%s' "${hash:0:8}"
+}
+
 # ---------- Parallel mode: token refresh engine ---------------------------
 #
-# Parallel mode runs Claude Code with a per-process CLAUDE_CODE_OAUTH_TOKEN
-# (which overrides the global Keychain at runtime) plus a per-process
-# CLAUDE_CONFIG_DIR. This lets multiple windows use different accounts
-# simultaneously without touching the active Keychain slot or the symlink.
+# Parallel mode runs Claude Code with per-process CLAUDE_CONFIG_DIR,
+# pointing to a profile directory. Claude Code reads/refreshes tokens from
+# its own hash-slot Keychain entry (Claude Code-credentials-<hash8>), where
+# <hash8> = sha256(configDir)[:8]. This allows multiple VS Code windows to
+# use different accounts simultaneously without mutual interference.
 #
-# OAuth access tokens expire (~24h) and the refresh token ROTATES on every
-# refresh, so a fresh refresh token must be written back to the profile's
-# Keychain backup slot or the next refresh fails. All parallel-mode commands
-# go through profile_access_token().
+# The refresh engine maintains a lock per profile and posts refresh requests.
+# Tokens written back are stored in the hash slot, where Claude Code reads them.
+# This design avoids two-writer conflicts and allows Claude Code to auto-refresh
+# without needing a per-process env-var override.
 
 require_jq() {
     has_jq || die "This command needs 'jq' (brew install jq)"
@@ -146,46 +156,53 @@ do_refresh() {
         '.claudeAiOauth.accessToken=$at
          | .claudeAiOauth.refreshToken=$rt
          | .claudeAiOauth.expiresAt=$exp')"
+    # Write to BOTH slots:
+    # - Hash slot: Claude Code reads this when CLAUDE_CONFIG_DIR is set (parallel mode)
+    # - Backup slot: cmd_use() reads this when restoring a profile (swap mode)
+    # This ensures parallel windows see the fresh token immediately, and swap mode
+    # can still restore profiles without re-logging-in.
+    local hash
+    hash="$(hash_slot "$BASE_DIR/$name")"
+    kc_save "$KEY_PREFIX$hash" "$new_blob" >/dev/null 2>&1
     kc_save "$KEY_PREFIX$name" "$new_blob" >/dev/null 2>&1
     printf '%s' "$new_at"
 }
 
 # Resolve a fresh access token for <profile>. Refreshes if expired.
+# Reads from the hash-slot Keychain entry (used by Claude Code in parallel mode).
+# Falls back to the backup slot if hash slot is missing.
 # Echoes the access token; dies with a clear message if unrecoverable.
 profile_access_token() {
     local name="$1"
     [[ -d "$BASE_DIR/$name" ]] || die "Profile '$name' not found (claude-switch list)"
-    kc_exists "$KEY_PREFIX$name" \
-        || die "Profile '$name' has no saved token — run 'claude-switch use $name' and log in first"
+
+    local hash
+    hash="$(hash_slot "$BASE_DIR/$name")"
 
     refresh_lock "$name"
     trap refresh_unlock EXIT
 
     local blob exp now at
-    blob="$(kc_read "$KEY_PREFIX$name")"
+
+    # Try hash slot (used by Claude Code in parallel mode)
+    if kc_exists "$KEY_PREFIX$hash"; then
+        blob="$(kc_read "$KEY_PREFIX$hash")"
+    # Fall back to backup slot (used by swap mode)
+    elif kc_exists "$KEY_PREFIX$name"; then
+        blob="$(kc_read "$KEY_PREFIX$name")"
+    else
+        refresh_unlock; trap - EXIT
+        die "Profile '$name' has no saved token — run 'claude-switch use $name' and log in first"
+    fi
+
     exp="$(printf '%s' "$blob" | jq -r '.claudeAiOauth.expiresAt // 0')"
     now="$(now_ms)"
 
     if [[ "$exp" -gt $(( now + TOKEN_REFRESH_SKEW * 1000 )) ]]; then
+        # Token is still valid; return it as-is.
         at="$(printf '%s' "$blob" | jq -r '.claudeAiOauth.accessToken // empty')"
     else
-        # Backup slot is expired. If this is the currently active profile,
-        # Claude Code may have written a fresh token to the active slot after
-        # a recent login — read it and update the backup slot before refreshing.
-        if [[ "$name" == "$(current_profile)" ]] && kc_exists "$ACTIVE_KEY"; then
-            local active_blob active_exp
-            active_blob="$(kc_read "$ACTIVE_KEY")"
-            active_exp="$(printf '%s' "$active_blob" | jq -r '.claudeAiOauth.expiresAt // 0')"
-            if [[ "$active_exp" -gt $(( now + TOKEN_REFRESH_SKEW * 1000 )) ]]; then
-                kc_save "$KEY_PREFIX$name" "$active_blob"
-                blob="$active_blob"
-                at="$(printf '%s' "$blob" | jq -r '.claudeAiOauth.accessToken // empty')"
-                refresh_unlock; trap - EXIT
-                [[ -n "$at" ]] || die "No token available for '$name'"
-                printf '%s' "$at"
-                return
-            fi
-        fi
+        # Token is expired; post a refresh and update both slots.
         local rc=0
         at="$(do_refresh "$name" "$blob")" || rc=$?
         if [[ $rc -ne 0 || -z "$at" ]]; then
@@ -314,7 +331,10 @@ cmd_list() {
         fi
     done
 
-    [[ $found -eq 0 ]] && info "No profiles yet — create one with: claude-switch create <name>"
+    if [[ $found -eq 0 ]]; then
+        info "No profiles yet — create one with: claude-switch create <name>"
+    fi
+    return 0
 }
 
 cmd_status() {
@@ -432,9 +452,10 @@ cmd_env() {
     require_jq
     local name="${1:-}"
     [[ -z "$name" ]] && die "Usage: claude-switch env <profile>"
-    local tok; tok="$(profile_access_token "$name")"
+    # Ensure the token is refreshed if needed before launching Claude Code.
+    profile_access_token "$name" >/dev/null
     printf 'export CLAUDE_CONFIG_DIR=%q\n' "$BASE_DIR/$name"
-    printf 'export CLAUDE_CODE_OAUTH_TOKEN=%q\n' "$tok"
+    printf 'unset CLAUDE_CODE_OAUTH_TOKEN\n'
 }
 
 cmd_run() {
@@ -442,9 +463,10 @@ cmd_run() {
     local name="${1:-}"; shift || true
     [[ -z "$name" ]] && die "Usage: claude-switch run <profile> [-- <cmd...>]"
     [[ "${1:-}" == "--" ]] && shift
-    local tok; tok="$(profile_access_token "$name")"
+    # Ensure the token is refreshed if needed before launching Claude Code.
+    profile_access_token "$name" >/dev/null
     export CLAUDE_CONFIG_DIR="$BASE_DIR/$name"
-    export CLAUDE_CODE_OAUTH_TOKEN="$tok"
+    unset CLAUDE_CODE_OAUTH_TOKEN
     if [[ $# -eq 0 ]]; then
         exec "$(claude_bin)"
     else
